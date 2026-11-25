@@ -2311,8 +2311,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.dispatch_inner(list, x, y, z, 0);
+    }
+
+    /// Runs a console DispatchX call. With USE_THREAD_DIMENSIONS, the
+    /// dimensions are raw thread counts, not group counts.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        self.dispatch_inner(list, x, y, z, flags);
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        // A dispatch may write the arguments held by an indirect window.
+        self.flush_window(list);
         list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2642,7 +2652,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.flush_window(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -3051,7 +3061,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.flush_window(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -3159,7 +3169,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.flush_window(list);
         if self.may_store() {
             list.gather_close();
         }
@@ -3303,8 +3313,10 @@ impl State {
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
-        if !windowed || first_on_list {
+        if first_on_list {
             self.window = None;
+        } else if !windowed {
+            self.flush_window(list);
         }
         if !windowed {
             // A dispatch, or shaders that store to buffers: arguments may
@@ -3339,7 +3351,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+            .map(|w| (w.scratch.clone(), w.scratch_offset + (offset - w.base), w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3434,6 +3446,7 @@ impl State {
                     None => (step, records),
                 };
                 self.window_read = false;
+                self.flush_window(list);
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
@@ -3488,8 +3501,9 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    scratch_offset: dst_offset,
                 });
-                (bounded, 0)
+                (bounded, dst_offset)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3503,6 +3517,9 @@ impl State {
             _ => false,
         };
         if !ran {
+            if self.window.is_none() && max > 0 {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3528,9 +3545,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        // The scratch buffer stays readable as arguments: the next draw of
-        // the window reads it with no barrier, and the next clamp moves it
-        // back (`crate::indirect`).
+        // A window retains the scratch buffer in INDIRECT_ARGUMENT state
+        // for its next draw. One-off clamps return it to COMMON immediately.
+        if self.window.is_none() && max > 0 {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
