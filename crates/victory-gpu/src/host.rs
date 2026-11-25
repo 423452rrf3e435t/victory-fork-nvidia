@@ -839,7 +839,15 @@ pub(crate) struct HostList {
     card_budget: OnceLock<Option<ID3D12Resource>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, u64)>>,
+    /// Device-local sub-allocator for GPU-to-GPU staging copies from shadow buffers.
+    gpu_copy: Mutex<Option<(ID3D12Resource, u64, u64, u64, bool)>>,
+    /// Whether this list has bound writable UAVs since its last global barrier.
+    uav_dirty: std::sync::atomic::AtomicBool,
+    /// Whether an indirect clamp has dispatched since this list was reset.
+    clamp_ran: std::sync::atomic::AtomicBool,
+    /// Whether a shader wrote through SLOT_MEMORY since this list was reset.
+    memory_dirty: std::sync::atomic::AtomicBool,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -1943,6 +1951,10 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// Host copies referenced by deferred refreshes or UAV writes.
+    shadows: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    /// Pointer addresses of `shadows` entries for O(1) deduplication.
+    shadow_ptrs: std::collections::HashSet<usize>,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -3846,6 +3858,10 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                gpu_copy: Mutex::default(),
+                uav_dirty: std::sync::atomic::AtomicBool::new(true),
+                clamp_ran: std::sync::atomic::AtomicBool::new(false),
+                memory_dirty: std::sync::atomic::AtomicBool::new(false),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
@@ -6889,78 +6905,102 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
-        let needed = size.max(64 << 10);
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let len = size.max(1).next_multiple_of(256);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
+        if let Some((buffer, cap, used)) = &mut *slot
+            && let Some(end) = used.checked_add(len)
+            && end <= *cap
         {
-            return Some(buffer.clone());
+            let offset = *used;
+            *used = end;
+            return Some((buffer.clone(), offset));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
-            .max(needed)
+            .max(len)
+            .max(64 << 10)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, len));
         drop(slot);
-        if let Some((old_buf, _)) = old {
-            // It ends the list common, as every scratch buffer does.
-            self.indirect_common(&old_buf);
+        if let Some((old_buf, _, _)) = old {
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, 0))
     }
 
-    /// Moves `scratch` back to the common state if a clamp left it readable
-    /// as indirect arguments ([`HostList::indirect_readable`]): where the
-    /// list's first clamp expects it. Done before the list closes and before
-    /// a bigger scratch buffer replaces it: one barrier per list (where
-    /// there was one per indirect execution), and the list ends as it
-    /// begins however it is submitted.
-    fn indirect_common(&self, scratch: &ID3D12Resource) {
+    /// Copies `len` bytes from `shadow` at title `address` into an `align`-byte-aligned
+    /// slice of a per-list `DEFAULT`-heap GPU buffer, avoiding CPU-side `defer_fill` /
+    /// `WHY_READ` settles. Returns `(dst_buffer, dst_offset, dst_gpu_address)` in
+    /// `D3D12_RESOURCE_STATE_GENERIC_READ` (valid for CBV and `COPY_SOURCE`).
+    pub(crate) fn gpu_copy_from_shadow(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        if len == 0 || shadow.left(address) < len {
+            return None;
+        }
+        let src_offset = shadow.offset_in(address)?;
+        shadow.refresh(self, address, len);
+        let align = align.max(256);
+        let aligned_len = len.next_multiple_of(align);
+        let mut slot = self.gpu_copy.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, dst_offset, dst_gpu, was_in_read) = if let Some((buffer, gpu_base, cap, used, in_read)) =
+            &mut *slot
+            && let Some(aligned_used) = Some(used.next_multiple_of(align))
+            && let Some(end) = aligned_used.checked_add(aligned_len)
+            && end <= *cap
         {
-            let mut deferred = self.deferred();
-            if deferred.indirect_readable != scratch.as_raw() as usize {
-                return;
-            }
-            deferred.indirect_readable = 0;
-        }
-        let barrier = transition(
-            scratch,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        );
-        // SAFETY: an open list and a live buffer this recording left in
-        // `INDIRECT_ARGUMENT`.
-        unsafe { self.list.ResourceBarrier(&[barrier]) };
-    }
-
-    /// The state the list's indirect scratch buffer `scratch` is in at this
-    /// point of the recording: indirect arguments if a clamp in this
-    /// recording left it so ([`HostList::indirect_readable`]), otherwise
-    /// common: the state a buffer is made in, and the one a recording
-    /// leaves it in when it closes or replaces it ([`HostList::indirect_common`]).
-    pub(crate) fn indirect_state(&self, scratch: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
-        if self.deferred().indirect_readable == scratch.as_raw() as usize {
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            let was = *in_read;
+            *in_read = true;
+            *used = end;
+            (buffer.clone(), aligned_used, *gpu_base + aligned_used, was)
         } else {
-            D3D12_RESOURCE_STATE_COMMON
+            let prev = slot.as_ref().map_or(0, |(_, _, cap, _, _)| *cap);
+            let alloc = prev
+                .saturating_mul(2)
+                .max(aligned_len)
+                .max(256 << 10)
+                .next_multiple_of(64 << 10);
+            let buffer = host()?.uav_buffer(alloc)?;
+            name(&buffer, || format!("gpu copy scratch {alloc:#x}"));
+            // SAFETY: a live committed D3D12 resource.
+            let gpu_base = unsafe { buffer.GetGPUVirtualAddress() };
+            let old = slot.replace((buffer.clone(), gpu_base, alloc, aligned_len, true));
+            drop(slot);
+            if let Some((old_buf, _, _, _, _)) = old {
+                self.keep(&old_buf);
+            }
+            (buffer, 0, gpu_base, false)
+        };
+        // SAFETY: `self.list` is open; `buffer` and `shadow.buffer` are kept alive
+        // on `self` until `HostList::reset`; D3D12 promotes from COMMON to COPY_DEST
+        // on the first copy when `!was_in_read`.
+        unsafe {
+            if self.uav_dirty() {
+                self.list.ResourceBarrier(&[uav_barrier(Some(&shadow.buffer))]);
+            }
+            if was_in_read {
+                self.list.ResourceBarrier(&[transition(
+                    &buffer,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            self.list.CopyBufferRegion(&buffer, dst_offset, &shadow.buffer, src_offset, len);
+            self.list.ResourceBarrier(&[transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )]);
         }
-    }
-
-    /// A clamp recorded in this list left `scratch` readable as indirect
-    /// arguments. It stays so for every execution that reads it, until the
-    /// next clamp moves it back to unordered access.
-    pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
-        self.deferred().indirect_readable = scratch.as_raw() as usize;
-    }
-
-    /// The list's buffers for `crate::indirect::window_check`.
-    pub(crate) fn window_check(&self) -> Option<&crate::indirect::WindowCheck> {
-        self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
+        Some((buffer, dst_offset, dst_gpu))
     }
 
     /// Keeps `object` alive until the list is reset.
