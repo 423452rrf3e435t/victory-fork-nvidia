@@ -307,6 +307,37 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     (before, now)
 }
 
+/// Whether \`[start, start + len)\` lies in a \`MEM_WRITE_WATCH\` allocation
+/// (the title's GPU memory reserved through XMemVirtualAlloc), without
+/// clearing any dirty-page bits.
+#[cfg(windows)]
+pub(crate) fn is_write_watched(start: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if len == 0 || start.checked_add(len).is_none() {
+        return false;
+    }
+    let mut pages = [std::ptr::null_mut(); 16];
+    let mut count = pages.len();
+    let mut granularity = 0u32;
+    // SAFETY: this is a read-only write-watch query (flags = 0); the kernel
+    // validates the requested region and the fixed-size result array.
+    unsafe {
+        GetWriteWatch(
+            0,
+            start as *const _,
+            len,
+            pages.as_mut_ptr(),
+            &mut count,
+            &mut granularity,
+        ) == 0
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_write_watched(_start: usize, _len: usize) -> bool {
+    false
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
