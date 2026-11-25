@@ -2367,7 +2367,7 @@ void main() {
             unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
             for (groups, src) in windows.iter().zip(&sources) {
                 let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
-                let scratch = bound_ahead(&list, (src, 0), spec).unwrap();
+                let (scratch, scratch_offset) = bound_ahead(&list, (src, 0), spec).unwrap();
                 assert_eq!(list.indirect_state(&scratch), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
@@ -2376,7 +2376,7 @@ void main() {
                     list.list.SetPipelineState(&worker.pso);
                     list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                     for i in 0..groups.len() as u64 {
-                        let at = i * u64::from(STEP);
+                        let at = scratch_offset + i * u64::from(STEP);
                         list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0);
                     }
                 }
