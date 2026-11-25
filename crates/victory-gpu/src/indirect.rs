@@ -50,6 +50,7 @@ cbuffer Record : register(b0) {
     // behind `count_buf` says (from `count_offset` on), and goes to slot i.
     uint has_count;
     uint count_offset;
+    uint dst_offset;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -91,7 +92,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if ((has_count & 4u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
     }
-    uint dst_at = id.x * stride;
+    uint dst_at = dst_offset + id.x * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -335,77 +336,94 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
-/// Records, in `list`, the non-destructive clamp of up to `records` records of
-/// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
-/// by the 32-bit count in `count` when given) into a device-local scratch
-/// buffer, at offset `0`. The scratch buffer is left in `INDIRECT_ARGUMENT`
-/// until the next clamp into it: executions read it with no barrier of
-/// their own. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp or alignment is not
-/// available.
+/// Records and clamps indirect arguments into a 256-byte-aligned slice of the
+/// list's device-local scratch buffer. The returned offset is part of the
+/// ExecuteIndirect argument address; multiple one-shot clamps can share one
+/// backing resource without overwriting one another.
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    let (c, (budget_res, budget), (dst, dst_offset)) =
+        (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let before = list.indirect_state(&dst);
+    let recorded = record_clamp_inner(
+        c,
+        Some(list),
+        &list.list,
+        (&dst, dst_offset),
+        before,
+        Some(budget_res),
+        budget,
+        src,
+        count,
+        spec,
+        false,
+    );
+    if recorded && spec.2 > 0 {
+        list.indirect_readable(&dst);
+    }
+    recorded.then_some((dst, dst_offset))
 }
 
-/// [`bound`] for a window of records clamped ahead of the draws that will
-/// read them (`crate::draw`'s windows; no count buffer). The records past
-/// the ones the title filled are whatever the buffer holds, and each
-/// record clamped charges the list's budget when it is clamped: a slot of
-/// all ones, clamped to the most a mesh dispatch runs (65,535 groups),
-/// charged a sixteenth of the budget, so sixteen of them emptied every
-/// draw of the list after them (run 93: "the largest group count asked for
-/// 4294967295", 43 to 153 such records a frame). Here a record that asks
-/// for more than can run is left empty and charges nothing; a record
-/// clamped alone is clamped and charged as before.
+/// The forward-window variant used for consecutive records.
 pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    let (c, (budget_res, budget), (dst, dst_offset)) =
+        (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let before = list.indirect_state(&dst);
+    let recorded = record_clamp_inner(
+        c,
+        Some(list),
+        &list.list,
+        (&dst, dst_offset),
+        before,
+        Some(budget_res),
+        budget,
+        src,
+        None,
+        spec,
+        true,
+    );
+    if recorded && spec.2 > 0 {
+        list.indirect_readable(&dst);
+    }
+    recorded.then_some((dst, dst_offset))
 }
 
-/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
-/// the list left it in; afterwards the list knows it is readable as
-/// indirect arguments.
-#[allow(clippy::too_many_arguments)]
-fn clamp_into(
-    list: &HostList,
+/// Compatibility wrapper for focused GPU tests. Production calls use the
+/// tracked variant so the list can order writable-UAV hazards.
+#[cfg(test)]
+fn record_clamp_as(
     c: &Clamp,
-    dst: &ID3D12Resource,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
-    if recorded {
-        list.indirect_readable(dst);
-    }
-    recorded
+    record_clamp_inner(
+        c, None, l, (dst, 0), before, None, budget, src, count, spec, ahead,
+    )
 }
 
-/// Records the clamp into `dst`, which is in state `before` (common, or
-/// indirect arguments after an earlier clamp into it), and leaves `dst` in
-/// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]). False, with nothing recorded, if the
-/// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
-fn record_clamp_as(
+fn record_clamp_inner(
     c: &Clamp,
+    list: Option<&HostList>,
     l: &ID3D12GraphicsCommandList,
-    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    (dst, dst_offset): (&ID3D12Resource, u64),
+    before: D3D12_RESOURCE_STATES,
+    budget_res: Option<&ID3D12Resource>,
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -423,8 +441,13 @@ fn record_clamp_as(
         return false;
     }
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_base.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    let (src_base, dst_base) = unsafe {
+        (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress())
+    };
+    if !src_base.is_multiple_of(4)
+        || !dst_base.is_multiple_of(4)
+        || !budget.is_multiple_of(4)
+    {
         return false;
     }
     let (src_gpu, args_offset) = match src_offset
@@ -470,48 +493,63 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
-    // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
-    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
-    // earlier execution's reads of the scratch buffer; nothing else writes it.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    if records == 0 {
+        return true;
+    }
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1),
+        count_offset,
+        dst_const_offset,
+    ];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
-    let first = [
-        uav_barrier(),
+
+    let mut first = [
+        crate::host::uav_barrier(None),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
-    unsafe {
-        // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+    let first_start = if !waits {
+        1
+    } else if list.is_none_or(|host_list| host_list.uav_dirty()) {
+        if let Some(host_list) = list {
+            host_list.clear_uav_dirty();
         }
-        l.ResourceBarrier(&second[skip..]);
+        0
+    } else if list.is_some_and(|host_list| host_list.clamp_ran()) && budget_res.is_some() {
+        first[0] = crate::host::uav_barrier(budget_res);
+        0
+    } else {
+        1
+    };
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, scratch destination, and budget buffers.
+    unsafe {
+        l.ResourceBarrier(&first[first_start..]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        if let Some(host_list) = list {
+            host_list.mark_clamp_ran();
+        }
+        l.ResourceBarrier(&second);
     }
     true
 }
