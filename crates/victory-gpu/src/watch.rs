@@ -1692,6 +1692,29 @@ mod tests {
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
     #[test]
+    fn is_write_watched_distinguishes_watch_allocs_from_heap() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let heap_buf = vec![0u8; PAGE];
+        assert!(!super::is_write_watched(heap_buf.as_ptr() as usize, PAGE));
+        // SAFETY: standalone write-watched reservation/commit freed below.
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!watched.is_null());
+        assert!(super::is_write_watched(watched as usize, PAGE));
+        // SAFETY: matches `VirtualAlloc` above.
+        unsafe { VirtualFree(watched, 0, MEM_RELEASE) };
+    }
+
+    #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
         writing(top, PAGE);
