@@ -5532,6 +5532,9 @@ impl Host {
             }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            // The async flight must carry whether its lists wrote through
+            // SLOT_MEMORY so the memory directory harvest runs on landing.
+            let memory_dirty = runs.iter().any(|l| l.take_memory_dirty());
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
