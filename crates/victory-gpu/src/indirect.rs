@@ -2196,9 +2196,15 @@ void main() {
             std::ptr::copy_nonoverlapping([11u32, 2, 1].as_ptr().cast::<u8>(), patch_ptr, 12);
         }
         let spec = (KIND_DISPATCH, STEP, records.len() as u32);
-        let scratch = bound_ahead(&list, (&src, 0), spec).unwrap();
+        let (scratch, scratch_offset) = bound_ahead(&list, (&src, 0), spec).unwrap();
         // Record 0: nothing wrote it.
-        assert!(check_hit(&list, (&src, 0), (KIND_DISPATCH, STEP), &scratch, 0));
+        assert!(check_hit(
+            &list,
+            (&src, 0),
+            (KIND_DISPATCH, STEP),
+            (&scratch, scratch_offset),
+            0,
+        ));
         // Record 1 is written on the card after the window's clamp.
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         // SAFETY: an open list; `src` was read by the clamp (promoted to a
@@ -2209,7 +2215,13 @@ void main() {
             list.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_DEST, read)]);
         }
         let at = u64::from(STEP);
-        assert!(check_hit(&list, (&src, at), (KIND_DISPATCH, STEP), &scratch, at));
+        assert!(check_hit(
+            &list,
+            (&src, at),
+            (KIND_DISPATCH, STEP),
+            (&scratch, scratch_offset),
+            at,
+        ));
         list.close();
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
         host.execute(&[&list]);
