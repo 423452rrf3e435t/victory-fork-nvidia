@@ -875,9 +875,10 @@ pub(crate) fn check_hit(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     (kind, step): (u32, u32),
-    scratch: &ID3D12Resource,
+    scratch: (&ID3D12Resource, u64),
     at: u64,
 ) -> bool {
+    let (scratch, scratch_offset) = scratch;
     const CHECK_USE: usize = usize::MAX - 0x78;
     let (Some(c), Some(cmp), Some(check)) = (clamp(), compare(), list.window_check()) else {
         return false;
@@ -920,7 +921,7 @@ pub(crate) fn check_hit(
             check.budget.GetGPUVirtualAddress(),
             check.results.GetGPUVirtualAddress(),
             check.args.GetGPUVirtualAddress(),
-            scratch.GetGPUVirtualAddress() + at,
+            scratch.GetGPUVirtualAddress() + scratch_offset + at,
         )
     };
     // The record again, by the window's rules, into the check's buffer
@@ -1925,35 +1926,33 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let (b1, offset1) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let (b2, offset2) =
+            bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
             "scratch buffer within capacity must be reused"
         );
+        assert!(offset2 > offset1, "each clamp gets a disjoint scratch slice");
         assert_eq!(list.indirect_state(&b2), args);
 
-        // A call needing >64 KiB grows the scratch buffer mid-list while keeping
-        // `b1` alive until reset. The new buffer starts out common.
-        let grown = list.indirect_scratch(5000 * 20).unwrap();
-        assert_eq!(
-            list.indirect_state(&grown),
-            D3D12_RESOURCE_STATE_COMMON,
-            "a new scratch buffer is common"
-        );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        assert_eq!(b3.as_raw(), grown.as_raw());
+        // A call needing more than the initial 64 KiB grows the scratch
+        // allocation. The replaced resource remains alive until list reset.
+        let (b3, offset3) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
             "larger request must grow scratch buffer"
         );
+        assert_eq!(offset3, 0, "a newly grown allocation starts at zero");
         assert_eq!(list.indirect_state(&b3), args);
         assert_eq!(
             list.indirect_state(&b1),
@@ -1977,12 +1976,14 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let (b4, offset4) =
+            bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
             "grown scratch buffer must persist across reset"
         );
+        assert_eq!(offset4, 0, "a reset starts the scratch bump allocator at zero");
         assert_eq!(list.indirect_state(&b4), args);
         list.close();
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
@@ -2119,15 +2120,16 @@ void main() {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            let _ = bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            let (scratch, scratch_offset) =
+                bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
                 list.list.SetComputeRootSignature(&worker.root);
                 list.list.SetPipelineState(&worker.pso);
                 list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-                list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+                list.list.ExecuteIndirect(&signature, 1, &scratch, scratch_offset, None, 0);
             }
             list.close();
             assert_eq!(host.log_messages(), None, "the debug layer found an error");
@@ -2141,13 +2143,14 @@ void main() {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        let (scratch, scratch_offset) =
+            bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
             list.list.SetPipelineState(&worker.pso);
             list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+            list.list.ExecuteIndirect(&signature, 1, &scratch, scratch_offset, None, 0);
         }
         list.close();
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
