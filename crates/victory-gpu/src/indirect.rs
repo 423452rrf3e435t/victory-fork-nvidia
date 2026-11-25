@@ -37,7 +37,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -419,9 +419,12 @@ fn record_clamp_as(
     ) else {
         return false;
     };
+    if !dst_offset.is_multiple_of(4) {
+        return false;
+    }
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if !src_base.is_multiple_of(4) || !dst_base.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
     let (src_gpu, args_offset) = match src_offset
@@ -431,6 +434,18 @@ fn record_clamp_as(
         Some(_) => (src_base, src_offset as u32),
         None => {
             let Some(rebased) = src_base.checked_add(src_offset) else {
+                return false;
+            };
+            (rebased, 0)
+        }
+    };
+    let (dst_gpu, dst_const_offset) = match dst_offset
+        .checked_add(bytes)
+        .filter(|&end| end <= u64::from(u32::MAX))
+    {
+        Some(_) => (dst_base, dst_offset as u32),
+        None => {
+            let Some(rebased) = dst_base.checked_add(dst_offset) else {
                 return false;
             };
             (rebased, 0)
@@ -1263,7 +1278,7 @@ void main() {
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
                 warp.list.Dispatch(1, 1, 1);
                 if mode == 2 {
-                    warp.list.ResourceBarrier(&[uav_barrier()]);
+                    warp.list.ResourceBarrier(&[crate::host::uav_barrier(None)]);
                     warp.list.SetComputeRootSignature(&fetch.root);
                     warp.list.SetPipelineState(&fetch.pso);
                     // Two groups for four pieces: the loop over pieces.
@@ -2864,14 +2879,14 @@ void work() {
                             Between::Compute | Between::ComputeWithWaits => {
                                 let waits = between == Between::ComputeWithWaits;
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[crate::host::uav_barrier(None)]);
                                 }
                                 l.SetComputeRootSignature(&self.work_root);
                                 l.SetPipelineState(&self.work);
                                 l.SetComputeRootUnorderedAccessView(0, self.words.GetGPUVirtualAddress());
                                 l.Dispatch(1, 1, 1);
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[crate::host::uav_barrier(None)]);
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }
