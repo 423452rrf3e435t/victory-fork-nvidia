@@ -6016,7 +6016,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
+        if let Some((scratch, _, _)) = scratch {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
