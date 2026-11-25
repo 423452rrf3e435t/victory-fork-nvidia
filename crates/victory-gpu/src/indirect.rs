@@ -398,9 +398,8 @@ pub(crate) fn bound_ahead(
     recorded.then_some((dst, dst_offset))
 }
 
-/// Compatibility wrapper for focused GPU tests. Production calls use the
-/// tracked variant so the list can order writable-UAV hazards.
-#[cfg(test)]
+/// Compatibility wrapper for focused GPU tests and diagnostic window checks.
+/// Production indirect calls use the tracked variant below.
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
